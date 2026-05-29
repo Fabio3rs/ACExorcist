@@ -54,6 +54,7 @@ enum : int {
     IDC_SKIN_LIST,
     IDC_TRACK_FILTER,
     IDC_TRACK_LIST,
+    IDC_LAYOUT_LIST,      // seletor de layout da pista
     IDC_WEATHER_FILTER,
     IDC_WEATHER_LIST,
     IDC_PRESET_NAME,
@@ -105,8 +106,9 @@ struct AppState {
     HWND results{};
     // Labels: stored so layout() can reposition them on resize
     HWND lbl_cars{}, lbl_skins{}, lbl_tracks{}, lbl_weather{}, lbl_preset{};
+    HWND layout_list{};   // combobox de layouts da pista
+    HWND lbl_layout{};    // label "Layout"
     ULONG_PTR gdiplus_token{};
-    HBITMAP splash_bitmap{};
     HBITMAP preview_bitmap{};
     HBITMAP track_bitmap{};
     HBITMAP flag_bitmap{};
@@ -119,7 +121,6 @@ struct AppState {
     RECT preview_draw_rect{};
     RECT track_draw_rect{};
     RECT flag_draw_rect{};
-    std::wstring checklist_text;
     std::vector<CatalogEntry> cars;
     std::vector<CatalogEntry> tracks;
     std::vector<CatalogEntry> weather;
@@ -131,6 +132,8 @@ struct AppState {
     std::wstring selected_car;
     std::wstring selected_skin;
     std::wstring selected_track;
+    std::wstring selected_layout;  // sublayout da pista (vazio = pista simples)
+    std::vector<std::wstring> track_layouts; // subpastas de layout disponíveis
     std::wstring selected_weather;
     std::wstring base_dir;
     std::wstring settings_path;
@@ -223,11 +226,6 @@ void log_line(const std::wstring& msg) {
 
 void set_status(const std::wstring& text) {
     if (g.status) SetWindowTextW(g.status, text.c_str());
-    log_line(text);
-}
-
-void set_result_text(const std::wstring& text) {
-    if (g.results) SetWindowTextW(g.results, text.c_str());
     log_line(text);
 }
 
@@ -476,19 +474,6 @@ void load_catalog() {
     }
 }
 
-void init_checklist() {
-    g.checklist_text =
-        L"Checklist:\r\n"
-        L"[x] Base WinAPI sem CEF\r\n"
-        L"[x] Catálogo local de carros/pistas/weather\r\n"
-        L"[x] Tema escuro e controles nativos\r\n"
-        L"[ ] Preview de carro selecionado\r\n"
-        L"[ ] Preview de pista selecionada\r\n"
-        L"[ ] Bandeiras de país\r\n"
-        L"[ ] Lista de favoritos mais rica\r\n"
-        L"[ ] Resultados e histórico com ListView\r\n";
-}
-
 void refresh_preset_names() {
     g.preset_names.clear();
     wchar_t buf[16384];
@@ -534,6 +519,55 @@ std::wstring listbox_item(HWND h, int idx) {
     return buf;
 }
 
+// Remove tags HTML simples (ex: <br/>) e converte para texto plano
+std::wstring strip_html(std::wstring s) {
+    for (const auto* br : {L"<br/>", L"<br />", L"<BR/>", L"<BR />"}) {
+        std::wstring tag = br;
+        size_t pos = 0;
+        while ((pos = s.find(tag, pos)) != std::wstring::npos)
+            s.replace(pos, tag.size(), L"\r\n");
+    }
+    std::wstring out; out.reserve(s.size());
+    bool in_tag = false;
+    for (wchar_t c : s) {
+        if (c == L'<')      { in_tag = true;  continue; }
+        if (c == L'>')      { in_tag = false; continue; }
+        if (!in_tag) out += c;
+    }
+    return trim(out);
+}
+
+// Descobre layouts disponíveis e popula o combobox IDC_LAYOUT_LIST
+void populate_layouts() {
+    g.track_layouts.clear();
+    SendMessageW(g.layout_list, CB_RESETCONTENT, 0, 0);
+    if (g.selected_track.empty()) {
+        ShowWindow(g.layout_list, SW_HIDE);
+        ShowWindow(g.lbl_layout,  SW_HIDE);
+        return;
+    }
+    fs::path ui = fs::path(g.base_dir) / L"content" / L"tracks" / g.selected_track / L"ui";
+    if (fs::exists(ui) && fs::is_directory(ui)) {
+        for (const auto& e : fs::directory_iterator(ui))
+            if (e.is_directory())
+                g.track_layouts.push_back(e.path().filename().wstring());
+        std::sort(g.track_layouts.begin(), g.track_layouts.end());
+    }
+    bool multi = !g.track_layouts.empty();
+    ShowWindow(g.layout_list, multi ? SW_SHOW : SW_HIDE);
+    ShowWindow(g.lbl_layout,  multi ? SW_SHOW : SW_HIDE);
+    if (!multi) { g.selected_layout.clear(); return; }
+
+    for (const auto& l : g.track_layouts)
+        SendMessageW(g.layout_list, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(l.c_str()));
+
+    int sel = 0;
+    for (int i = 0; i < static_cast<int>(g.track_layouts.size()); ++i)
+        if (g.track_layouts[static_cast<size_t>(i)] == g.selected_layout) { sel = i; break; }
+    SendMessageW(g.layout_list, CB_SETCURSEL, static_cast<WPARAM>(sel), 0);
+    g.selected_layout = g.track_layouts[static_cast<size_t>(sel)];
+}
+
 void update_cars() {
     std::wstring needle = lower(get_window_text(g.car_filter));
     g.filtered_cars.clear();
@@ -552,23 +586,24 @@ void refresh_track_preview() {
     fs::path base = fs::path(g.base_dir) / L"content" / L"tracks" / g.selected_track;
     fs::path ui   = base / L"ui";
 
-    // Busca preview na ordem: ui/preview.png → primeiro layout em ui/*/preview.png
-    // → ui/outline.png → ui/*/outline.png → raiz
     auto find_img = [&](std::wstring_view name) -> fs::path {
-        // Direto em ui/
-        fs::path direct = ui / name;
-        if (file_exists(direct)) return direct;
-        // Subpastas de layout em ui/
+        // 1. Layout selecionado (se houver)
+        if (!g.selected_layout.empty()) {
+            fs::path p = ui / g.selected_layout / name;
+            if (file_exists(p)) return p;
+        }
+        // 2. Direto em ui/ (pistas simples)
+        { fs::path p = ui / name; if (file_exists(p)) return p; }
+        // 3. Qualquer sublayout
         if (fs::exists(ui) && fs::is_directory(ui)) {
             for (const auto& entry : fs::directory_iterator(ui)) {
                 if (!entry.is_directory()) continue;
-                fs::path candidate = entry.path() / name;
-                if (file_exists(candidate)) return candidate;
+                fs::path p = entry.path() / name;
+                if (file_exists(p)) return p;
             }
         }
-        // Raiz da pista (pistas modadas mais antigas)
-        fs::path root = base / name;
-        if (file_exists(root)) return root;
+        // 4. Raiz (pistas modadas antigas)
+        { fs::path p = base / name; if (file_exists(p)) return p; }
         return {};
     };
 
@@ -593,6 +628,7 @@ void update_tracks() {
     }
     fill_listbox(g.track_list, g.filtered_tracks);
     restore_listbox_selection(g.track_list, g.filtered_tracks, g.selected_track);
+    populate_layouts();
     refresh_track_preview();
     update_results_list();
 }
@@ -654,111 +690,171 @@ CatalogEntry* find_weather(const std::wstring& id) {
     return nullptr;
 }
 
-void sync_selection_from_ui() {
-    int c = listbox_selected(g.car_list);
-    if (c >= 0 && c < static_cast<int>(g.filtered_cars.size())) {
-        g.selected_car = extract_id_from_row(g.filtered_cars[static_cast<size_t>(c)]);
-    }
-    int s = listbox_selected(g.skin_list);
-    if (s >= 0 && s < static_cast<int>(g.filtered_skins.size())) {
-        g.selected_skin = extract_id_from_row(g.filtered_skins[static_cast<size_t>(s)]);
-    }
-    int t = listbox_selected(g.track_list);
-    if (t >= 0 && t < static_cast<int>(g.filtered_tracks.size())) {
-        g.selected_track = extract_id_from_row(g.filtered_tracks[static_cast<size_t>(t)]);
-    }
-    int w = listbox_selected(g.weather_list);
-    if (w >= 0 && w < static_cast<int>(g.filtered_weather.size())) {
-        g.selected_weather = extract_id_from_row(g.filtered_weather[static_cast<size_t>(w)]);
-    }
-}
+void update_status_panel() {
+    std::wstring text;
 
-void reflect_selection() {
-    update_skins();
-    set_status(L"Selections updated.");
-}
-
-void select_first_visible(HWND list, const std::vector<std::wstring>& items) {
-    if (!items.empty()) SendMessageW(list, LB_SETCURSEL, 0, 0);
-}
-
-void set_default_selection() {
-    if (!g.cars.empty()) {
-        g.selected_car = g.cars.front().id;
-        if (!g.cars.front().skins.empty()) g.selected_skin = g.cars.front().skins.front().id;
+    // Descrição do carro
+    if (!g.selected_car.empty()) {
+        fs::path car_json = fs::path(g.base_dir) / L"content" / L"cars" / g.selected_car / L"ui" / L"ui_car.json";
+        if (file_exists(car_json)) {
+            try {
+                json j = json::parse(read_file_utf8(car_json));
+                if (j.contains("description") && j["description"].is_string()) {
+                    std::wstring desc = strip_html(widen(j["description"].get<std::string>()));
+                    if (!desc.empty()) text += desc + L"\r\n";
+                }
+            } catch (...) {}
+        }
     }
-    if (!g.tracks.empty()) g.selected_track = g.tracks.front().id;
-    if (!g.weather.empty()) g.selected_weather = g.weather.front().id;
-}
 
-void update_checklist_status() {
-    std::wstring text = g.checklist_text;
-    text += L"\r\nSelected car: " + g.selected_car + L"\r\nSelected track: " + g.selected_track;
+    // Descrição da pista (usa layout selecionado se houver)
+    if (!g.selected_track.empty()) {
+        fs::path ui = fs::path(g.base_dir) / L"content" / L"tracks" / g.selected_track / L"ui";
+        fs::path track_json = g.selected_layout.empty()
+            ? ui / L"ui_track.json"
+            : ui / g.selected_layout / L"ui_track.json";
+        if (!file_exists(track_json)) track_json = ui / L"ui_track.json";
+        if (file_exists(track_json)) {
+            try {
+                json j = json::parse(read_file_utf8(track_json));
+                if (j.contains("description") && j["description"].is_string()) {
+                    std::wstring desc = strip_html(widen(j["description"].get<std::string>()));
+                    if (!desc.empty()) text += desc + L"\r\n";
+                }
+            } catch (...) {}
+        }
+    }
+
     SetWindowTextW(g.status, text.c_str());
 }
 
 void update_results_list() {
     if (!g.results) return;
     ListView_DeleteAllItems(g.results);
-    auto add_row = [&](int row, const std::wstring& label, const std::wstring& value) {
+    int row = 0;
+    auto add_row = [&](const std::wstring& label, const std::wstring& value) {
         LVITEMW item{};
         item.mask = LVIF_TEXT;
         item.iItem = row;
         item.pszText = const_cast<LPWSTR>(label.c_str());
         ListView_InsertItem(g.results, &item);
         ListView_SetItemText(g.results, row, 1, const_cast<LPWSTR>(value.c_str()));
+        ++row;
     };
+
+    // ── Specs do carro ──────────────────────────────────────────────────
+    if (!g.selected_car.empty()) {
+        fs::path car_json = fs::path(g.base_dir) / L"content" / L"cars" / g.selected_car / L"ui" / L"ui_car.json";
+        if (file_exists(car_json)) {
+            try {
+                json j = json::parse(read_file_utf8(car_json));
+                auto jw = [&](const char* k) -> std::wstring {
+                    return (j.contains(k) && j[k].is_string()) ? widen(j[k].get<std::string>()) : L"";
+                };
+                add_row(L"Car",     jw("name"));
+                add_row(L"Brand",   jw("brand"));
+                add_row(L"Class",   jw("class"));
+                if (j.contains("specs") && j["specs"].is_object()) {
+                    auto& s = j["specs"];
+                    auto sw = [&](const char* k) -> std::wstring {
+                        return (s.contains(k) && s[k].is_string()) ? widen(s[k].get<std::string>()) : L"";
+                    };
+                    add_row(L"BHP",          sw("bhp"));
+                    add_row(L"Torque",       sw("torque"));
+                    add_row(L"Weight",       sw("weight"));
+                    add_row(L"Top Speed",    sw("topspeed"));
+                    add_row(L"Acceleration", sw("acceleration"));
+                    add_row(L"P/W Ratio",    sw("pwratio"));
+                }
+                if (j.contains("tags") && j["tags"].is_array()) {
+                    std::wstring tags;
+                    for (const auto& t : j["tags"])
+                        if (t.is_string()) { if (!tags.empty()) tags += L", "; tags += widen(t.get<std::string>()); }
+                    if (!tags.empty()) add_row(L"Tags", tags);
+                }
+            } catch (...) {}
+        }
+    }
+
+    // ── Specs da pista ──────────────────────────────────────────────────
+    if (!g.selected_track.empty()) {
+        fs::path ui = fs::path(g.base_dir) / L"content" / L"tracks" / g.selected_track / L"ui";
+        fs::path track_json = (!g.selected_layout.empty() && file_exists(ui / g.selected_layout / L"ui_track.json"))
+            ? ui / g.selected_layout / L"ui_track.json"
+            : ui / L"ui_track.json";
+        if (file_exists(track_json)) {
+            try {
+                json j = json::parse(read_file_utf8(track_json));
+                auto jw = [&](const char* k) -> std::wstring {
+                    return (j.contains(k) && j[k].is_string()) ? widen(j[k].get<std::string>()) : L"";
+                };
+                add_row(L"Track",    jw("name"));
+                add_row(L"Country",  jw("country"));
+                add_row(L"City",     jw("city"));
+                std::wstring len = jw("length");
+                if (!len.empty()) add_row(L"Length",   len + L" m");
+                std::wstring w = jw("width");
+                if (!w.empty())   add_row(L"Width",    w + L" m");
+                std::wstring pb = jw("pitboxes");
+                if (!pb.empty())  add_row(L"Pitboxes", pb);
+                std::wstring run = jw("run");
+                if (!run.empty()) add_row(L"Direction", run);
+            } catch (...) {}
+        }
+    }
+
+    // ── Separador + resultados de corrida ───────────────────────────────
+    if (row > 0) add_row(L"─── Race Results ───", L"");
+
     std::wstring race_out_path = (fs::path(g.base_dir) / L"race_out.json").wstring();
-    std::wstring laps_path = (fs::path(g.base_dir) / L"laps.ini").wstring();
-    int row = 0;
+    std::wstring laps_path     = (fs::path(g.base_dir) / L"laps.ini").wstring();
 
     if (file_exists(fs::path(race_out_path))) {
         try {
             json j = json::parse(read_file_utf8(fs::path(race_out_path)));
-            add_row(row++, L"Source", L"race_out.json");
+            add_row(L"Source", L"race_out.json");
             if (j.contains("players") && j["players"].is_array()) {
-                add_row(row++, L"Players", std::to_wstring(j["players"].size()));
+                add_row(L"Players", std::to_wstring(j["players"].size()));
                 for (const auto& p : j["players"]) {
                     std::wstring line = to_json_w(p, "name") + L" | " + to_json_w(p, "car") + L" | " + to_json_w(p, "skin");
-                    add_row(row++, L"Player", line);
+                    add_row(L"Player", line);
                 }
             }
             if (j.contains("sessions") && j["sessions"].is_object()) {
                 const auto& s = j["sessions"];
                 if (s.contains("bestLaps") && s["bestLaps"].is_array()) {
-                    add_row(row++, L"BestLaps", std::to_wstring(s["bestLaps"].size()));
+                    add_row(L"BestLaps", std::to_wstring(s["bestLaps"].size()));
                     for (const auto& bl : s["bestLaps"]) {
                         std::wstring line = L"car=" + to_json_num_w(bl, "car") + L" time=" + to_json_num_w(bl, "time");
-                        add_row(row++, L"BestLap", line);
+                        add_row(L"BestLap", line);
                     }
                 }
-                if (s.contains("laps") && s["laps"].is_array()) {
-                    add_row(row++, L"Laps", std::to_wstring(s["laps"].size()));
-                }
+                if (s.contains("laps") && s["laps"].is_array())
+                    add_row(L"Laps", std::to_wstring(s["laps"].size()));
             }
             return;
-        } catch (...) {
-        }
+        } catch (...) {}
     }
 
     if (file_exists(fs::path(laps_path))) {
-        add_row(row++, L"Source", L"laps.ini");
+        add_row(L"Source", L"laps.ini");
         wchar_t buf[2048];
         GetPrivateProfileSectionNamesW(buf, 2048, fs::path(laps_path).c_str());
         const wchar_t* p = buf;
-        while (*p && row < 40) {
+        while (*p && row < 60) {
             std::wstring section = p;
             if (section.rfind(L"LAP_", 0) == 0) {
-                std::wstring time = ini_get(fs::path(laps_path), section, L"TIME", L"");
+                std::wstring time   = ini_get(fs::path(laps_path), section, L"TIME", L"");
                 std::wstring splits = ini_get(fs::path(laps_path), section, L"SPLITS", L"");
-                add_row(row++, section, L"time=" + time + L" splits=" + splits);
+                add_row(section, L"time=" + time + L" splits=" + splits);
             }
             p += section.size() + 1;
         }
         return;
     }
 
-    add_row(row++, L"Source", L"No result files found");
+    if (row == 0 || (row == 1))
+        add_row(L"Source", L"No result files found");
 }
 
 void invalidate_frame() {
@@ -769,9 +865,10 @@ void invalidate_frame() {
 }
 
 void load_last_state() {
-    g.selected_car = ini_get(g.settings_path, L"LAST", L"CAR", L"");
-    g.selected_skin = ini_get(g.settings_path, L"LAST", L"SKIN", L"");
-    g.selected_track = ini_get(g.settings_path, L"LAST", L"TRACK", L"");
+    g.selected_car     = ini_get(g.settings_path, L"LAST", L"CAR", L"");
+    g.selected_skin    = ini_get(g.settings_path, L"LAST", L"SKIN", L"");
+    g.selected_track   = ini_get(g.settings_path, L"LAST", L"TRACK", L"");
+    g.selected_layout  = ini_get(g.settings_path, L"LAST", L"LAYOUT", L"");
     g.selected_weather = ini_get(g.settings_path, L"LAST", L"WEATHER", L"");
     if (g.selected_car.empty() && !g.cars.empty()) g.selected_car = g.cars.front().id;
     if (g.selected_track.empty() && !g.tracks.empty()) g.selected_track = g.tracks.front().id;
@@ -786,6 +883,7 @@ void save_last_state() {
     ini_set(g.settings_path, L"LAST", L"CAR", g.selected_car);
     ini_set(g.settings_path, L"LAST", L"SKIN", g.selected_skin);
     ini_set(g.settings_path, L"LAST", L"TRACK", g.selected_track);
+    ini_set(g.settings_path, L"LAST", L"LAYOUT", g.selected_layout);
     ini_set(g.settings_path, L"LAST", L"WEATHER", g.selected_weather);
 }
 
@@ -821,6 +919,8 @@ bool patch_race_ini() {
     if (!file_exists(path)) return false;
     ini_set(path, L"RACE", L"MODEL", g.selected_car);
     ini_set(path, L"RACE", L"TRACK", g.selected_track);
+    // AC usa CONFIG_TRACK para selecionar o layout em pistas multi-layout
+    ini_set(path, L"RACE", L"CONFIG_TRACK", g.selected_layout);
     ini_set(path, L"RACE", L"CARS", L"1");
     ini_set(path, L"WEATHER", L"NAME", g.selected_weather);
     ini_set(path, L"CAR_0", L"MODEL", g.selected_car);
@@ -895,30 +995,8 @@ bool launch_showroom() {
     return false;
 }
 
-std::wstring read_results_summary() {
-    fs::path race_out = fs::path(g.base_dir) / L"race_out.json";
-    fs::path laps = fs::path(g.base_dir) / L"laps.ini";
-    if (file_exists(race_out)) {
-        try {
-            json j = json::parse(read_file_utf8(race_out));
-            std::wstringstream ss;
-            ss << L"race_out.json:\r\n";
-            if (j.contains("players") && j["players"].is_array()) {
-                ss << L"players=" << j["players"].size() << L"\r\n";
-                for (const auto& p : j["players"]) {
-                    ss << L"- " << to_json_w(p, "name") << L" / " << to_json_w(p, "car") << L" / " << to_json_w(p, "skin") << L"\r\n";
-                }
-            }
-            return ss.str();
-        } catch (...) {
-        }
-    }
-    if (file_exists(laps)) return L"laps.ini present, but no parsed summary in this clone yet.";
-    return L"No result files found.";
-}
-
 void refresh_results() {
-    set_result_text(read_results_summary());
+    update_results_list();
 }
 
 void apply_selection_to_ui() {
@@ -1019,14 +1097,22 @@ void layout(HWND hwnd) {
     MoveWindow(g.preset_list,   col2,                   list2_y,    pcombo_w,   140,       TRUE);
     MoveWindow(g.delete_preset, col2 + pcombo_w + 4,    list2_y,    kSaveBtnW,  kControlH, TRUE);
 
-    // ---- Row 2 col3: Launch buttons (col3 only – col4 é reservado para previews)
+    // ---- Row 2 col3: Layout selector + botões de launch ----------------
+    // Layout ocupa a primeira linha; botões seguem abaixo
+    constexpr int kLayoutH = kControlH;
+    int layout_y  = row2_y;
+    int btns_start = layout_y + kLayoutH + kLGap;
+
+    MoveWindow(g.lbl_layout,  col3,            layout_y + 3, kLabelW,       kLayoutH,   TRUE);
+    MoveWindow(g.layout_list, col3 + kLabelW,  layout_y,     col - kLabelW, kLayoutH,   TRUE);
+
     int btns_x = col3;
     int btns_w = col;
     int half   = (btns_w - 4) / 2;
-    MoveWindow(g.launch_race,     btns_x,            row2_y,                      half,              kBtnH, TRUE);
-    MoveWindow(g.launch_showroom, btns_x + half + 4, row2_y,                      btns_w - half - 4, kBtnH, TRUE);
-    MoveWindow(g.launch_original, btns_x,            row2_y + kBtnH + kBtnGap,   btns_w,             kBtnH, TRUE);
-    MoveWindow(g.refresh_results, btns_x,            row2_y + 2*(kBtnH+kBtnGap), btns_w,             kBtnH, TRUE);
+    MoveWindow(g.launch_race,     btns_x,            btns_start,                      half,              kBtnH, TRUE);
+    MoveWindow(g.launch_showroom, btns_x + half + 4, btns_start,                      btns_w - half - 4, kBtnH, TRUE);
+    MoveWindow(g.launch_original, btns_x,            btns_start + kBtnH + kBtnGap,   btns_w,             kBtnH, TRUE);
+    MoveWindow(g.refresh_results, btns_x,            btns_start + 2*(kBtnH+kBtnGap), btns_w,             kBtnH, TRUE);
 
     // ---- Results and Status ---------------------------------------------
     MoveWindow(g.results, left, results_y, usable, kResultsH, TRUE);
@@ -1073,6 +1159,9 @@ void create_controls(HWND hwnd) {
     g.lbl_tracks    = mk(L"STATIC",  L"Tracks",  WS_CHILD | WS_VISIBLE, 0, 0, kLabelW, kControlH, 0);
     g.track_filter  = mk(L"EDIT",    L"",        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 100, kControlH, IDC_TRACK_FILTER);
     g.track_list    = mk(L"LISTBOX", L"",        WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOTIFY | WS_VSCROLL, 0, 0, 100, kListH, IDC_TRACK_LIST);
+    // Layout selector – visível só para pistas multi-layout (ShowWindow gerenciado em populate_layouts)
+    g.lbl_layout  = mk(L"STATIC",   L"Layout",  WS_CHILD, 0, 0, kLabelW, kControlH, 0);
+    g.layout_list = mk(L"COMBOBOX", L"",        WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 100, 200, IDC_LAYOUT_LIST);
 
     g.lbl_weather    = mk(L"STATIC",  L"Weather", WS_CHILD | WS_VISIBLE, 0, 0, kLabelW, kControlH, 0);
     g.weather_filter = mk(L"EDIT",    L"",        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 100, kControlH, IDC_WEATHER_FILTER);
@@ -1117,7 +1206,6 @@ void load_presets_into_combo() {
 void init_state() {
     g.base_dir = get_module_dir();
     g.settings_path = fs::path(g.base_dir) / L"ACExorcist.ini";
-    init_checklist();
     load_catalog();
     load_last_state();
     ensure_steam_appid();
@@ -1127,7 +1215,7 @@ void refresh_ui_from_state() {
     apply_selection_to_ui();
     load_presets_into_combo();
     if (!g.preset_names.empty()) SendMessageW(g.preset_list, CB_SETCURSEL, 0, 0);
-    update_checklist_status();
+    update_status_panel();
     update_results_list();
 }
 
@@ -1179,7 +1267,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                     auto* car = find_car(g.selected_car);
                     if (car) g.selected_skin = car->skins.empty() ? L"default" : car->skins.front().id;
                     update_skins();
-                    update_checklist_status();
+                    update_status_panel();
                     update_results_list();
                 }
             }
@@ -1192,7 +1280,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                         fs::path p = fs::path(g.base_dir) / L"content" / L"cars" / g.selected_car / L"skins" / g.selected_skin / L"preview.jpg";
                         set_preview_bitmap(load_bitmap_from_file(p));
                     }
-                    update_checklist_status();
+                    update_status_panel();
                     update_results_list();
                 }
             }
@@ -1200,8 +1288,19 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 int idx = listbox_selected(g.track_list);
                 if (idx >= 0 && idx < static_cast<int>(g.filtered_tracks.size())) {
                     g.selected_track = extract_id_from_row(g.filtered_tracks[static_cast<size_t>(idx)]);
+                    g.selected_layout.clear(); // reset layout ao mudar de pista
+                    populate_layouts();
                     refresh_track_preview();
-                    update_checklist_status();
+                    update_status_panel();
+                    update_results_list();
+                }
+            }
+            if (id == IDC_LAYOUT_LIST && code == CBN_SELCHANGE) {
+                int idx = static_cast<int>(SendMessageW(g.layout_list, CB_GETCURSEL, 0, 0));
+                if (idx >= 0 && idx < static_cast<int>(g.track_layouts.size())) {
+                    g.selected_layout = g.track_layouts[static_cast<size_t>(idx)];
+                    refresh_track_preview();
+                    update_status_panel();
                     update_results_list();
                 }
             }
@@ -1209,7 +1308,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 int idx = listbox_selected(g.weather_list);
                 if (idx >= 0 && idx < static_cast<int>(g.filtered_weather.size())) {
                     g.selected_weather = extract_id_from_row(g.filtered_weather[static_cast<size_t>(idx)]);
-                    update_checklist_status();
+                    update_status_panel();
                     update_results_list();
                 }
             }
@@ -1313,7 +1412,6 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int ncmdshow) {
     if (g.preview_bitmap) DeleteObject(g.preview_bitmap);
     if (g.track_bitmap)   DeleteObject(g.track_bitmap);
     if (g.flag_bitmap)    DeleteObject(g.flag_bitmap);
-    if (g.splash_bitmap)  DeleteObject(g.splash_bitmap);
     if (g.gdiplus_token) GdiplusShutdown(g.gdiplus_token);
     return static_cast<int>(msg.wParam);
 }
