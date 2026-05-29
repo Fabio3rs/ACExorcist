@@ -103,7 +103,6 @@ struct AppState {
     HWND launch_showroom{};
     HWND launch_original{};
     HWND refresh_results{};
-    HWND results{};
     // Labels: stored so layout() can reposition them on resize
     HWND lbl_cars{}, lbl_skins{}, lbl_tracks{}, lbl_weather{}, lbl_preset{};
     HWND layout_list{};   // combobox de layouts da pista
@@ -111,6 +110,7 @@ struct AppState {
     ULONG_PTR gdiplus_token{};
     HBITMAP preview_bitmap{};
     HBITMAP track_bitmap{};
+    HBITMAP track_outline_bitmap{};   // outline/map sobreposto ao track preview
     HBITMAP flag_bitmap{};
     HFONT   app_font{};
     HFONT   title_font{};
@@ -121,6 +121,14 @@ struct AppState {
     RECT preview_draw_rect{};
     RECT track_draw_rect{};
     RECT flag_draw_rect{};
+    RECT curve_draw_rect{};   // torque/power curve panel (replaces ListView)
+    // Bitmaps de background do painel de curva (bandeira do carro + badge)
+    HBITMAP car_curve_flag_bitmap{};  // bandeira do país do carro
+    HBITMAP car_badge_bitmap{};       // badge/logo do carro (ui/badge.png)
+    // Torque and power curves loaded from ui_car.json
+    std::vector<std::pair<float,float>> curve_torque;
+    std::vector<std::pair<float,float>> curve_power;
+    std::wstring curve_specs_line;  // specs do carro quando sem dados de curva
     std::vector<CatalogEntry> cars;
     std::vector<CatalogEntry> tracks;
     std::vector<CatalogEntry> weather;
@@ -144,7 +152,8 @@ AppState g;
 CatalogEntry* find_car(const std::wstring& id);
 CatalogEntry* find_track(const std::wstring& id);
 CatalogEntry* find_weather(const std::wstring& id);
-void update_results_list();
+void load_car_curves();
+void update_status_panel();
 
 std::wstring widen(const std::string& s) {
     if (s.empty()) return {};
@@ -207,6 +216,28 @@ bool write_file_utf8(const fs::path& path, const std::string& content) {
 
 bool file_exists(const fs::path& path) {
     return fs::exists(path) && fs::is_regular_file(path);
+}
+
+// Os arquivos JSON do Assetto Corsa contêm caracteres de controle literais
+// (ASCII < 0x20) em strings de descrição, o que é JSON inválido.
+// Esta função sanitiza antes de parsear para que todos os carros sejam lidos.
+json parse_json_file(const fs::path& path) {
+    std::string raw = read_file_utf8(path);
+    // Os arquivos do AC contêm caracteres de controle literais (incluindo \n e \r)
+    // dentro de strings JSON — inválido por spec. Sanitizamos rastreando se estamos
+    // dentro de uma string para substituir controle chars apenas onde são ilegais.
+    bool in_string = false;
+    bool escaped   = false;
+    for (char& c : raw) {
+        if (escaped) { escaped = false; continue; }
+        if (c == '\\' && in_string) { escaped = true; continue; }
+        if (c == '"') { in_string = !in_string; continue; }
+        if (in_string) {
+            unsigned char u = static_cast<unsigned char>(c);
+            if (u < 0x20) c = ' ';   // substitui QUALQUER controle char dentro de string
+        }
+    }
+    return json::parse(raw);
 }
 
 std::wstring ini_get(const fs::path& path, const std::wstring& section, const std::wstring& key, const std::wstring& fallback = L"") {
@@ -318,10 +349,28 @@ void set_track_bitmap(HBITMAP bmp) {
     if (g.hwnd) InvalidateRect(g.hwnd, &g.track_draw_rect, FALSE);
 }
 
+void set_track_outline_bitmap(HBITMAP bmp) {
+    if (g.track_outline_bitmap) DeleteObject(g.track_outline_bitmap);
+    g.track_outline_bitmap = bmp;
+    if (g.hwnd) InvalidateRect(g.hwnd, &g.track_draw_rect, FALSE);
+}
+
 void set_flag_bitmap(HBITMAP bmp) {
     if (g.flag_bitmap) DeleteObject(g.flag_bitmap);
     g.flag_bitmap = bmp;
     if (g.hwnd) InvalidateRect(g.hwnd, &g.flag_draw_rect, FALSE);
+}
+
+void set_car_curve_flag_bitmap(HBITMAP bmp) {
+    if (g.car_curve_flag_bitmap) DeleteObject(g.car_curve_flag_bitmap);
+    g.car_curve_flag_bitmap = bmp;
+    if (g.hwnd) InvalidateRect(g.hwnd, &g.curve_draw_rect, FALSE);
+}
+
+void set_car_badge_bitmap(HBITMAP bmp) {
+    if (g.car_badge_bitmap) DeleteObject(g.car_badge_bitmap);
+    g.car_badge_bitmap = bmp;
+    if (g.hwnd) InvalidateRect(g.hwnd, &g.curve_draw_rect, FALSE);
 }
 
 void draw_bitmap_scaled(HDC hdc, HBITMAP bmp, const RECT& rc) {
@@ -400,7 +449,278 @@ void paint_frame(HDC hdc, const RECT& client) {
 
     draw_panel(g.preview_bitmap, g.preview_draw_rect, L"Car preview");
     draw_panel(g.track_bitmap,   g.track_draw_rect,   L"Track preview");
-    draw_panel(g.flag_bitmap,    g.flag_draw_rect,     L"Flag");
+
+    // Overlay do contorno da pista sobre o track preview
+    if (g.track_outline_bitmap && g.track_draw_rect.right > g.track_draw_rect.left) {
+        const RECT& tr = g.track_draw_rect;
+        // Usa GDI+ para desenhar o outline com fundo preto transparente e 70% de opacidade
+        Graphics gfx(hdc);
+        gfx.SetInterpolationMode(InterpolationModeHighQualityBilinear);
+        Bitmap outlineBmp(g.track_outline_bitmap, nullptr);
+        // Color key: torna pixels escuros (fundo preto) transparentes
+        ImageAttributes ia;
+        ia.SetColorKey(Color(0, 0, 0), Color(80, 80, 80));
+        // Matriz de cor: aplica 65% de opacidade global
+        ColorMatrix cm = {{
+            {1, 0, 0, 0,     0},
+            {0, 1, 0, 0,     0},
+            {0, 0, 1, 0,     0},
+            {0, 0, 0, 0.65f, 0},
+            {0, 0, 0, 0,     1}
+        }};
+        ia.SetColorMatrix(&cm, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);
+        int iw = static_cast<int>(outlineBmp.GetWidth());
+        int ih = static_cast<int>(outlineBmp.GetHeight());
+        gfx.DrawImage(&outlineBmp,
+            Rect(tr.left + 1, tr.top + 1, tr.right - tr.left - 2, tr.bottom - tr.top - 2),
+            0, 0, iw, ih, UnitPixel, &ia);
+    }
+    // Bandeira: se painel existe mas bitmap nulo e pista está selecionada, mostra aviso
+    if (g.flag_draw_rect.right > g.flag_draw_rect.left) {
+        if (g.flag_bitmap) {
+            draw_panel(g.flag_bitmap, g.flag_draw_rect, L"Flag");
+        } else {
+            // Fundo + borda igual ao draw_panel
+            HBRUSH panel_bg = CreateSolidBrush(kClrCtrlBg2);
+            FillRect(hdc, &g.flag_draw_rect, panel_bg);
+            DeleteObject(panel_bg);
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(55, 58, 75));
+            HPEN oldpen = reinterpret_cast<HPEN>(SelectObject(hdc, pen));
+            HBRUSH oldbr = reinterpret_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
+            Rectangle(hdc, g.flag_draw_rect.left, g.flag_draw_rect.top, g.flag_draw_rect.right, g.flag_draw_rect.bottom);
+            SelectObject(hdc, oldpen); SelectObject(hdc, oldbr);
+            DeleteObject(pen);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(70, 73, 90));
+            HFONT ff = reinterpret_cast<HFONT>(SelectObject(hdc, g.app_font ? g.app_font : GetStockObject(DEFAULT_GUI_FONT)));
+            RECT flr{g.flag_draw_rect.left+6, g.flag_draw_rect.top+4, g.flag_draw_rect.right-4, g.flag_draw_rect.bottom-4};
+            const wchar_t* flag_msg = g.selected_track.empty() ? L"Flag" : L"Bandeira não disponível";
+            DrawTextW(hdc, flag_msg, -1, &flr, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            SelectObject(hdc, ff);
+        }
+    }
+
+    // ── Torque / Power curve panel ──────────────────────────────────────
+    const RECT& cr = g.curve_draw_rect;
+    if (cr.right > cr.left) {
+        // Background + border
+        HBRUSH cbg = CreateSolidBrush(kClrCtrlBg2);
+        FillRect(hdc, &cr, cbg);
+        DeleteObject(cbg);
+        HPEN border = CreatePen(PS_SOLID, 1, RGB(55, 58, 75));
+        HPEN oldp = reinterpret_cast<HPEN>(SelectObject(hdc, border));
+        HBRUSH oldb = reinterpret_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
+        Rectangle(hdc, cr.left, cr.top, cr.right, cr.bottom);
+        SelectObject(hdc, oldp); SelectObject(hdc, oldb);
+        DeleteObject(border);
+
+        // ── Bandeira do carro + badge como background (GDI+) ─────────────
+        {
+            // Helper: desenha HBITMAP com opacidade global + color key opcional
+            auto draw_bmp_alpha = [&](HBITMAP hbmp, Rect dest,
+                                      float alpha,
+                                      bool use_color_key = false,
+                                      Color ck_lo = Color(0,0,0),
+                                      Color ck_hi = Color(0,0,0)) {
+                if (!hbmp) return;
+                Graphics gfx(hdc);
+                gfx.SetInterpolationMode(InterpolationModeHighQualityBilinear);
+                Bitmap bmp(hbmp, nullptr);
+                ImageAttributes ia;
+                if (use_color_key)
+                    ia.SetColorKey(ck_lo, ck_hi);
+                ColorMatrix cm = {{
+                    {1, 0, 0, 0,     0},
+                    {0, 1, 0, 0,     0},
+                    {0, 0, 1, 0,     0},
+                    {0, 0, 0, alpha, 0},
+                    {0, 0, 0, 0,     1}
+                }};
+                ia.SetColorMatrix(&cm, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);
+                int sw = static_cast<int>(bmp.GetWidth());
+                int sh = static_cast<int>(bmp.GetHeight());
+                gfx.DrawImage(&bmp, dest, 0, 0, sw, sh, UnitPixel, &ia);
+            };
+
+            int pw = cr.right  - cr.left;
+            int ph = cr.bottom - cr.top;
+
+            // Bandeira: centralizada, proporção correta, ~75% da altura do painel
+            if (g.car_curve_flag_bitmap) {
+                BITMAP bm{}; GetObject(g.car_curve_flag_bitmap, sizeof(bm), &bm);
+                float aspect = (bm.bmHeight > 0) ? static_cast<float>(bm.bmWidth) / bm.bmHeight : 1.5f;
+                int dh = static_cast<int>(ph * 0.75f);
+                int dw = static_cast<int>(dh * aspect);
+                if (dw > pw - 4) { dw = pw - 4; dh = static_cast<int>(dw / aspect); }
+                int dx = cr.left + (pw - dw) / 2;
+                int dy = cr.top  + (ph - dh) / 2;
+                draw_bmp_alpha(g.car_curve_flag_bitmap, Rect(dx, dy, dw, dh), 0.10f);
+            }
+
+            // Badge: canto inferior direito, 60×60 no máximo, mantendo proporção
+            if (g.car_badge_bitmap) {
+                constexpr int kBadgeMax = 60;
+                BITMAP bm{}; GetObject(g.car_badge_bitmap, sizeof(bm), &bm);
+                float aspect = (bm.bmHeight > 0) ? static_cast<float>(bm.bmWidth) / bm.bmHeight : 1.0f;
+                int dw, dh;
+                if (aspect >= 1.0f) { dw = kBadgeMax; dh = static_cast<int>(kBadgeMax / aspect); }
+                else                { dh = kBadgeMax; dw = static_cast<int>(kBadgeMax * aspect); }
+                int dx = cr.right  - dw - 6;
+                int dy = cr.bottom - dh - 6;
+                // badge tem fundo branco geralmente — torna branco/quase-branco transparente
+                draw_bmp_alpha(g.car_badge_bitmap, Rect(dx, dy, dw, dh), 0.30f,
+                               true, Color(190, 190, 190), Color(255, 255, 255));
+            }
+        }
+
+        if (g.curve_torque.empty() && g.curve_power.empty()) {
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(70, 73, 90));
+            HFONT f2 = reinterpret_cast<HFONT>(SelectObject(hdc, g.app_font ? g.app_font : GetStockObject(DEFAULT_GUI_FONT)));
+            RECT lr{cr.left+8, cr.top+6, cr.right-4, cr.bottom-4};
+            if (g.selected_car.empty()) {
+                DrawTextW(hdc, L"Selecione um carro para ver as curvas", -1, &lr, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            } else if (!g.curve_specs_line.empty()) {
+                // Exibe specs do carro + aviso de ausência de curvas
+                DrawTextW(hdc, g.curve_specs_line.c_str(), -1, &lr, DT_LEFT | DT_TOP | DT_WORDBREAK);
+                RECT lr2{cr.left+8, cr.top+22, cr.right-4, cr.bottom-4};
+                SetTextColor(hdc, RGB(55, 58, 72));
+                DrawTextW(hdc, L"Dados de curva não disponíveis para este carro", -1, &lr2, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            } else {
+                DrawTextW(hdc, L"Dados de curva não disponíveis", -1, &lr, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            }
+            SelectObject(hdc, f2);
+        } else {
+            constexpr int kPad = 44; // left margin for y-axis labels
+            constexpr int kBotPad = 18; // bottom margin for x-axis labels
+            int gx = cr.left  + kPad;
+            int gy = cr.top   + 8;
+            int gw = cr.right  - cr.left - kPad - 6;
+            int gh = cr.bottom - cr.top  - gy + cr.top - kBotPad;
+
+            // Compute raw ranges
+            float max_rpm = 0, max_torque = 0, max_power = 0;
+            for (auto& [r, v] : g.curve_torque) { max_rpm = std::max(max_rpm, r); max_torque = std::max(max_torque, v); }
+            for (auto& [r, v] : g.curve_power)  { max_rpm = std::max(max_rpm, r); max_power  = std::max(max_power,  v); }
+            float max_y = std::max(max_torque, max_power);
+
+            if (max_rpm > 0 && max_y > 0) {
+                // ── "Nice" round step helper ──────────────────────────────
+                auto nice_step = [](float maxv, int n) -> float {
+                    float raw = maxv / n;
+                    // magnitude = largest power of 10 ≤ raw
+                    float mag = 1.f;
+                    if (raw >= 1.f) { while (mag * 10.f <= raw) mag *= 10.f; }
+                    else            { while (mag > raw) mag /= 10.f; }
+                    float norm = raw / mag;
+                    float nice = (norm < 1.5f) ? 1.f : (norm < 3.5f) ? 2.5f : (norm < 7.5f) ? 5.f : 10.f;
+                    return nice * mag;
+                };
+
+                // Align axis maxima to grid
+                float y_step       = nice_step(max_y,   4);
+                float x_step       = nice_step(max_rpm, 5);
+                float y_axis_max   = std::ceil(max_y   / y_step)   * y_step;
+                float x_axis_max   = std::ceil(max_rpm / x_step)   * x_step;
+
+                // Pixel mappers using grid-aligned maxima
+                auto px_x = [&](float rpm) -> int { return gx + static_cast<int>(rpm / x_axis_max * gw); };
+                auto px_y = [&](float val) -> int { return gy + gh - static_cast<int>(val / y_axis_max * gh); };
+                auto to_px = [&](float rpm, float val) -> POINT { return {px_x(rpm), px_y(val)}; };
+
+                SetBkMode(hdc, TRANSPARENT);
+                HFONT f2 = reinterpret_cast<HFONT>(SelectObject(hdc, g.app_font ? g.app_font : GetStockObject(DEFAULT_GUI_FONT)));
+                wchar_t nb[32];
+
+                // ── Grid ─────────────────────────────────────────────────
+                // Horizontal lines (Y axis) with labels
+                HPEN grid_pen = CreatePen(PS_SOLID, 1, RGB(42, 47, 68));
+                SelectObject(hdc, grid_pen);
+                for (float yv = y_step; yv <= y_axis_max + 0.01f; yv += y_step) {
+                    int yy = px_y(yv);
+                    if (yy < gy || yy > gy + gh) continue;
+                    MoveToEx(hdc, gx, yy, nullptr); LineTo(hdc, gx + gw, yy);
+                    swprintf(nb, 32, L"%.0f", yv);
+                    SetTextColor(hdc, RGB(68, 74, 100));
+                    RECT rl{cr.left + 2, yy - 7, gx - 3, yy + 7};
+                    DrawTextW(hdc, nb, -1, &rl, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                }
+                // Vertical lines (X axis / RPM) with labels
+                for (float xv = x_step; xv <= x_axis_max + 0.01f; xv += x_step) {
+                    int xx = px_x(xv);
+                    if (xx < gx || xx > gx + gw) continue;
+                    MoveToEx(hdc, xx, gy, nullptr); LineTo(hdc, xx, gy + gh);
+                    swprintf(nb, 32, L"%.0f", xv);
+                    SetTextColor(hdc, RGB(68, 74, 100));
+                    RECT rl{xx - 26, gy + gh + 2, xx + 26, cr.bottom - 1};
+                    DrawTextW(hdc, nb, -1, &rl, DT_CENTER | DT_TOP);
+                }
+                // Left axis border line
+                MoveToEx(hdc, gx, gy, nullptr); LineTo(hdc, gx, gy + gh + 1);
+                // Bottom axis border line
+                MoveToEx(hdc, gx, gy + gh, nullptr); LineTo(hdc, gx + gw, gy + gh);
+                DeleteObject(grid_pen);
+
+                // ── "rpm" unit label at bottom-right ─────────────────────
+                SetTextColor(hdc, RGB(55, 60, 82));
+                RECT ru{gx + gw - 26, gy + gh + 2, cr.right - 4, cr.bottom - 1};
+                DrawTextW(hdc, L"rpm", -1, &ru, DT_LEFT | DT_TOP);
+
+                // ── Torque curve — red ────────────────────────────────────
+                if (g.curve_torque.size() >= 2) {
+                    std::vector<POINT> pts;
+                    pts.reserve(g.curve_torque.size());
+                    for (auto& [r, v] : g.curve_torque) pts.push_back(to_px(r, v));
+                    HPEN tp = CreatePen(PS_SOLID, 2, RGB(210, 55, 55));
+                    SelectObject(hdc, tp);
+                    Polyline(hdc, pts.data(), static_cast<int>(pts.size()));
+                    DeleteObject(tp);
+                }
+                // ── Power curve — orange ──────────────────────────────────
+                if (g.curve_power.size() >= 2) {
+                    std::vector<POINT> pts;
+                    pts.reserve(g.curve_power.size());
+                    for (auto& [r, v] : g.curve_power) pts.push_back(to_px(r, v));
+                    HPEN pp = CreatePen(PS_SOLID, 2, RGB(215, 135, 25));
+                    SelectObject(hdc, pp);
+                    Polyline(hdc, pts.data(), static_cast<int>(pts.size()));
+                    DeleteObject(pp);
+                }
+
+                // ── Y-axis unit labels (colored, at top-left) ─────────────
+                if (max_torque > 0) {
+                    SetTextColor(hdc, RGB(200, 70, 70));
+                    RECT r2{cr.left + 1, gy, gx - 2, gy + 13};
+                    DrawTextW(hdc, L"Nm", -1, &r2, DT_RIGHT | DT_TOP);
+                }
+                if (max_power > 0) {
+                    SetTextColor(hdc, RGB(200, 135, 40));
+                    RECT r2{cr.left + 1, gy + 13, gx - 2, gy + 26};
+                    DrawTextW(hdc, L"hp", -1, &r2, DT_RIGHT | DT_TOP);
+                }
+
+                // ── Legend (top-left inside chart area) ───────────────────
+                int lx = gx + 8, ly = gy + 4;
+                HPEN lp = CreatePen(PS_SOLID, 3, RGB(210, 55, 55));
+                SelectObject(hdc, lp);
+                MoveToEx(hdc, lx, ly + 7, nullptr); LineTo(hdc, lx + 16, ly + 7);
+                DeleteObject(lp);
+                SetTextColor(hdc, RGB(220, 80, 80));
+                RECT lr{lx + 19, ly, lx + 80, ly + 15};
+                DrawTextW(hdc, L"Torque", -1, &lr, DT_LEFT | DT_TOP);
+
+                lp = CreatePen(PS_SOLID, 3, RGB(215, 135, 25));
+                SelectObject(hdc, lp);
+                MoveToEx(hdc, lx + 80, ly + 7, nullptr); LineTo(hdc, lx + 96, ly + 7);
+                DeleteObject(lp);
+                SetTextColor(hdc, RGB(215, 150, 50));
+                lr = {lx + 99, ly, lx + 160, ly + 15};
+                DrawTextW(hdc, L"Power", -1, &lr, DT_LEFT | DT_TOP);
+
+                SelectObject(hdc, f2);
+            }
+        }
+    }
 }
 
 void add_catalog_entry(std::vector<CatalogEntry>& dest, const fs::path& dir, bool track_mode) {
@@ -412,7 +732,7 @@ void add_catalog_entry(std::vector<CatalogEntry>& dest, const fs::path& dir, boo
     fs::path ui_json = dir / "ui" / (track_mode ? "ui_track.json" : "ui_car.json");
     if (file_exists(ui_json)) {
         try {
-            json j = json::parse(read_file_utf8(ui_json));
+            json j = parse_json_file(ui_json);
             if (j.contains("name")) e.display = widen(j["name"].get<std::string>());
             if (track_mode && j.contains("country") && j["country"].is_string()) {
                 e.country = country_to_flag_code(widen(j["country"].get<std::string>()));
@@ -608,13 +928,21 @@ void refresh_track_preview() {
     };
 
     fs::path p = find_img(L"preview.png");
-    if (p.empty()) p = find_img(L"outline.png");
+    // Se não há foto de preview, usa outline/map como imagem principal
     if (p.empty()) p = find_img(L"map.png");
     set_track_bitmap(p.empty() ? nullptr : load_bitmap_from_file(p));
 
+    // Overlay do contorno da pista (branco sobre preto → sobreposição semi-transparente)
+    fs::path o = find_img(L"outline.png");
+    set_track_outline_bitmap(o.empty() ? nullptr : load_bitmap_from_file(o));
+
     auto* track = find_track(g.selected_track);
-    if (track && !track->country.empty())
-        set_flag_bitmap(load_bitmap_from_file(fs::path(g.base_dir) / L"content" / L"gui" / L"NationFlags" / (track->country + L".png")));
+    if (track && !track->country.empty()) {
+        HBITMAP fb = load_bitmap_from_file(fs::path(g.base_dir) / L"content" / L"gui" / L"NationFlags" / (track->country + L".png"));
+        set_flag_bitmap(fb);  // pode ser nullptr se arquivo não existir
+    } else {
+        set_flag_bitmap(nullptr);  // pista sem país → limpa bandeira anterior
+    }
 }
 
 void update_tracks() {
@@ -630,7 +958,7 @@ void update_tracks() {
     restore_listbox_selection(g.track_list, g.filtered_tracks, g.selected_track);
     populate_layouts();
     refresh_track_preview();
-    update_results_list();
+    update_status_panel();
 }
 
 void update_weather() {
@@ -665,9 +993,12 @@ void update_skins() {
     }
     auto* car = find_car(g.selected_car);
     if (car && !car->country.empty()) {
-        set_flag_bitmap(load_bitmap_from_file(fs::path(g.base_dir) / L"content" / L"gui" / L"NationFlags" / (car->country + L".png")));
+        HBITMAP fb = load_bitmap_from_file(fs::path(g.base_dir) / L"content" / L"gui" / L"NationFlags" / (car->country + L".png"));
+        set_flag_bitmap(fb);  // pode ser nullptr se arquivo não existir
+    } else {
+        set_flag_bitmap(nullptr);  // carro sem país → limpa bandeira anterior
     }
-    update_results_list();
+    update_status_panel();
 }
 
 std::wstring extract_id_from_row(const std::wstring& row) {
@@ -690,15 +1021,103 @@ CatalogEntry* find_weather(const std::wstring& id) {
     return nullptr;
 }
 
+void load_car_curves() {
+    g.curve_torque.clear();
+    g.curve_power.clear();
+    g.curve_specs_line.clear();
+    set_car_curve_flag_bitmap(nullptr);
+    set_car_badge_bitmap(nullptr);
+    if (!g.selected_car.empty()) {
+        fs::path car_ui   = fs::path(g.base_dir) / L"content" / L"cars" / g.selected_car / L"ui";
+        fs::path car_json = car_ui / L"ui_car.json";
+        if (file_exists(car_json)) {
+            try {
+                json j = parse_json_file(car_json);
+                auto load = [&](const char* key, std::vector<std::pair<float,float>>& out) {
+                    if (!j.contains(key) || !j[key].is_array()) return;
+                    for (const auto& pt : j[key]) {
+                        if (!pt.is_array() || pt.size() < 2) continue;
+                        try {
+                            float rpm = std::stof(pt[0].get<std::string>());
+                            float val = std::stof(pt[1].get<std::string>());
+                            out.push_back({rpm, val});
+                        } catch (...) {}
+                    }
+                };
+                load("torqueCurve", g.curve_torque);
+                load("powerCurve",  g.curve_power);
+
+                // Se sem curvas, monta linha de specs para exibir no painel
+                if (g.curve_torque.empty() && g.curve_power.empty()) {
+                    std::wstring line;
+                    if (j.contains("name") && j["name"].is_string())
+                        line = widen(j["name"].get<std::string>());
+                    if (j.contains("specs") && j["specs"].is_object()) {
+                        auto& s = j["specs"];
+                        auto sw = [&](const char* k) -> std::wstring {
+                            return (s.contains(k) && s[k].is_string()) ? widen(s[k].get<std::string>()) : L"";
+                        };
+                        auto app = [&](const wchar_t* lbl, const std::wstring& val) {
+                            if (val.empty() || val == L"--" || val.rfind(L"--", 0) == 0) return;
+                            if (!line.empty()) line += L"   ";
+                            line += lbl + val;
+                        };
+                        app(L"", sw("bhp"));
+                        app(L"", sw("torque"));
+                        app(L"", sw("weight"));
+                        app(L"top: ", sw("topspeed"));
+                        app(L"P/W: ", sw("pwratio"));
+                    }
+                    g.curve_specs_line = line;
+                }
+
+                // Bandeira do país do carro (via tags)
+                std::wstring flag_code = infer_car_country_from_tags(j);
+                if (!flag_code.empty()) {
+                    fs::path fp = fs::path(g.base_dir) / L"content" / L"gui" / L"NationFlags" / (flag_code + L".png");
+                    set_car_curve_flag_bitmap(load_bitmap_from_file(fp));
+                }
+            } catch (...) {}
+        }
+        // Badge do carro (content/cars/{id}/ui/badge.png)
+        fs::path badge_path = car_ui / L"badge.png";
+        set_car_badge_bitmap(load_bitmap_from_file(badge_path));
+    }
+    if (g.hwnd) InvalidateRect(g.hwnd, &g.curve_draw_rect, FALSE);
+}
+
 void update_status_panel() {
     std::wstring text;
 
-    // Descrição do carro
+    // ── Specs do carro (linha compacta) ─────────────────────────────────
     if (!g.selected_car.empty()) {
         fs::path car_json = fs::path(g.base_dir) / L"content" / L"cars" / g.selected_car / L"ui" / L"ui_car.json";
         if (file_exists(car_json)) {
             try {
-                json j = json::parse(read_file_utf8(car_json));
+                json j = parse_json_file(car_json);
+                // Nome + specs numa linha
+                std::wstring specs_line;
+                auto app = [&](const wchar_t* lbl, const std::wstring& val) {
+                    if (val.empty() || val == L"--" || val.rfind(L"--", 0) == 0) return;
+                    if (!specs_line.empty()) specs_line += L"   ";
+                    specs_line += lbl + val;
+                };
+                if (j.contains("name") && j["name"].is_string())
+                    specs_line = widen(j["name"].get<std::string>());
+                if (j.contains("specs") && j["specs"].is_object()) {
+                    auto& s = j["specs"];
+                    auto sw = [&](const char* k) -> std::wstring {
+                        return (s.contains(k) && s[k].is_string()) ? widen(s[k].get<std::string>()) : L"";
+                    };
+                    if (!specs_line.empty()) specs_line += L"   ";
+                    app(L"",      sw("bhp"));
+                    app(L"",      sw("torque"));
+                    app(L"",      sw("weight"));
+                    app(L"top: ", sw("topspeed"));
+                    app(L"P/W: ", sw("pwratio"));
+                }
+                if (!specs_line.empty()) text += specs_line + L"\r\n";
+                // Descrição
                 if (j.contains("description") && j["description"].is_string()) {
                     std::wstring desc = strip_html(widen(j["description"].get<std::string>()));
                     if (!desc.empty()) text += desc + L"\r\n";
@@ -707,161 +1126,77 @@ void update_status_panel() {
         }
     }
 
-    // Descrição da pista (usa layout selecionado se houver)
+    // ── Specs + descrição da pista ───────────────────────────────────────
     if (!g.selected_track.empty()) {
         fs::path ui = fs::path(g.base_dir) / L"content" / L"tracks" / g.selected_track / L"ui";
-        fs::path track_json = g.selected_layout.empty()
-            ? ui / L"ui_track.json"
-            : ui / g.selected_layout / L"ui_track.json";
+        fs::path track_json = (!g.selected_layout.empty() && file_exists(ui / g.selected_layout / L"ui_track.json"))
+            ? ui / g.selected_layout / L"ui_track.json"
+            : ui / L"ui_track.json";
         if (!file_exists(track_json)) track_json = ui / L"ui_track.json";
         if (file_exists(track_json)) {
             try {
-                json j = json::parse(read_file_utf8(track_json));
+                json j = parse_json_file(track_json);
+                auto jw = [&](const char* k) -> std::wstring {
+                    return (j.contains(k) && j[k].is_string()) ? widen(j[k].get<std::string>()) : L"";
+                };
+                std::wstring track_line = jw("name");
+                auto tapp = [&](const wchar_t* lbl, const std::wstring& val) {
+                    if (val.empty()) return;
+                    if (!track_line.empty()) track_line += L"   ";
+                    track_line += lbl + val;
+                };
+                tapp(L"", jw("country"));
+                std::wstring len = jw("length");
+                if (!len.empty()) tapp(L"", len + L"m");
+                tapp(L"pits: ", jw("pitboxes"));
+                if (!track_line.empty()) text += track_line + L"\r\n";
                 if (j.contains("description") && j["description"].is_string()) {
                     std::wstring desc = strip_html(widen(j["description"].get<std::string>()));
                     if (!desc.empty()) text += desc + L"\r\n";
                 }
             } catch (...) {}
+        }
+    }
+
+    // ── Resultados de corrida ────────────────────────────────────────────
+    fs::path race_out = fs::path(g.base_dir) / L"race_out.json";
+    fs::path laps     = fs::path(g.base_dir) / L"laps.ini";
+    if (file_exists(race_out)) {
+        try {
+            json j = parse_json_file(race_out);
+            text += L"── Race Results (race_out.json) ──\r\n";
+            if (j.contains("players") && j["players"].is_array()) {
+                for (const auto& p : j["players"])
+                    text += to_json_w(p, "name") + L" | " + to_json_w(p, "car") + L" | " + to_json_w(p, "skin") + L"\r\n";
+            }
+        } catch (...) {}
+    } else if (file_exists(laps)) {
+        text += L"── Race Results (laps.ini) ──\r\n";
+        wchar_t buf[4096];
+        GetPrivateProfileSectionNamesW(buf, 4096, laps.c_str());
+        const wchar_t* p = buf;
+        int cnt = 0;
+        while (*p && cnt < 30) {
+            std::wstring section = p;
+            if (section.rfind(L"LAP_", 0) == 0) {
+                text += section + L": time=" + ini_get(laps, section, L"TIME", L"") + L"\r\n";
+                ++cnt;
+            }
+            p += section.size() + 1;
         }
     }
 
     SetWindowTextW(g.status, text.c_str());
 }
 
-void update_results_list() {
-    if (!g.results) return;
-    ListView_DeleteAllItems(g.results);
-    int row = 0;
-    auto add_row = [&](const std::wstring& label, const std::wstring& value) {
-        LVITEMW item{};
-        item.mask = LVIF_TEXT;
-        item.iItem = row;
-        item.pszText = const_cast<LPWSTR>(label.c_str());
-        ListView_InsertItem(g.results, &item);
-        ListView_SetItemText(g.results, row, 1, const_cast<LPWSTR>(value.c_str()));
-        ++row;
-    };
-
-    // ── Specs do carro ──────────────────────────────────────────────────
-    if (!g.selected_car.empty()) {
-        fs::path car_json = fs::path(g.base_dir) / L"content" / L"cars" / g.selected_car / L"ui" / L"ui_car.json";
-        if (file_exists(car_json)) {
-            try {
-                json j = json::parse(read_file_utf8(car_json));
-                auto jw = [&](const char* k) -> std::wstring {
-                    return (j.contains(k) && j[k].is_string()) ? widen(j[k].get<std::string>()) : L"";
-                };
-                add_row(L"Car",     jw("name"));
-                add_row(L"Brand",   jw("brand"));
-                add_row(L"Class",   jw("class"));
-                if (j.contains("specs") && j["specs"].is_object()) {
-                    auto& s = j["specs"];
-                    auto sw = [&](const char* k) -> std::wstring {
-                        return (s.contains(k) && s[k].is_string()) ? widen(s[k].get<std::string>()) : L"";
-                    };
-                    add_row(L"BHP",          sw("bhp"));
-                    add_row(L"Torque",       sw("torque"));
-                    add_row(L"Weight",       sw("weight"));
-                    add_row(L"Top Speed",    sw("topspeed"));
-                    add_row(L"Acceleration", sw("acceleration"));
-                    add_row(L"P/W Ratio",    sw("pwratio"));
-                }
-                if (j.contains("tags") && j["tags"].is_array()) {
-                    std::wstring tags;
-                    for (const auto& t : j["tags"])
-                        if (t.is_string()) { if (!tags.empty()) tags += L", "; tags += widen(t.get<std::string>()); }
-                    if (!tags.empty()) add_row(L"Tags", tags);
-                }
-            } catch (...) {}
-        }
-    }
-
-    // ── Specs da pista ──────────────────────────────────────────────────
-    if (!g.selected_track.empty()) {
-        fs::path ui = fs::path(g.base_dir) / L"content" / L"tracks" / g.selected_track / L"ui";
-        fs::path track_json = (!g.selected_layout.empty() && file_exists(ui / g.selected_layout / L"ui_track.json"))
-            ? ui / g.selected_layout / L"ui_track.json"
-            : ui / L"ui_track.json";
-        if (file_exists(track_json)) {
-            try {
-                json j = json::parse(read_file_utf8(track_json));
-                auto jw = [&](const char* k) -> std::wstring {
-                    return (j.contains(k) && j[k].is_string()) ? widen(j[k].get<std::string>()) : L"";
-                };
-                add_row(L"Track",    jw("name"));
-                add_row(L"Country",  jw("country"));
-                add_row(L"City",     jw("city"));
-                std::wstring len = jw("length");
-                if (!len.empty()) add_row(L"Length",   len + L" m");
-                std::wstring w = jw("width");
-                if (!w.empty())   add_row(L"Width",    w + L" m");
-                std::wstring pb = jw("pitboxes");
-                if (!pb.empty())  add_row(L"Pitboxes", pb);
-                std::wstring run = jw("run");
-                if (!run.empty()) add_row(L"Direction", run);
-            } catch (...) {}
-        }
-    }
-
-    // ── Separador + resultados de corrida ───────────────────────────────
-    if (row > 0) add_row(L"─── Race Results ───", L"");
-
-    std::wstring race_out_path = (fs::path(g.base_dir) / L"race_out.json").wstring();
-    std::wstring laps_path     = (fs::path(g.base_dir) / L"laps.ini").wstring();
-
-    if (file_exists(fs::path(race_out_path))) {
-        try {
-            json j = json::parse(read_file_utf8(fs::path(race_out_path)));
-            add_row(L"Source", L"race_out.json");
-            if (j.contains("players") && j["players"].is_array()) {
-                add_row(L"Players", std::to_wstring(j["players"].size()));
-                for (const auto& p : j["players"]) {
-                    std::wstring line = to_json_w(p, "name") + L" | " + to_json_w(p, "car") + L" | " + to_json_w(p, "skin");
-                    add_row(L"Player", line);
-                }
-            }
-            if (j.contains("sessions") && j["sessions"].is_object()) {
-                const auto& s = j["sessions"];
-                if (s.contains("bestLaps") && s["bestLaps"].is_array()) {
-                    add_row(L"BestLaps", std::to_wstring(s["bestLaps"].size()));
-                    for (const auto& bl : s["bestLaps"]) {
-                        std::wstring line = L"car=" + to_json_num_w(bl, "car") + L" time=" + to_json_num_w(bl, "time");
-                        add_row(L"BestLap", line);
-                    }
-                }
-                if (s.contains("laps") && s["laps"].is_array())
-                    add_row(L"Laps", std::to_wstring(s["laps"].size()));
-            }
-            return;
-        } catch (...) {}
-    }
-
-    if (file_exists(fs::path(laps_path))) {
-        add_row(L"Source", L"laps.ini");
-        wchar_t buf[2048];
-        GetPrivateProfileSectionNamesW(buf, 2048, fs::path(laps_path).c_str());
-        const wchar_t* p = buf;
-        while (*p && row < 60) {
-            std::wstring section = p;
-            if (section.rfind(L"LAP_", 0) == 0) {
-                std::wstring time   = ini_get(fs::path(laps_path), section, L"TIME", L"");
-                std::wstring splits = ini_get(fs::path(laps_path), section, L"SPLITS", L"");
-                add_row(section, L"time=" + time + L" splits=" + splits);
-            }
-            p += section.size() + 1;
-        }
-        return;
-    }
-
-    if (row == 0 || (row == 1))
-        add_row(L"Source", L"No result files found");
-}
+void refresh_results() { update_status_panel(); }
 
 void invalidate_frame() {
     if (!g.hwnd) return;
     InvalidateRect(g.hwnd, &g.preview_draw_rect, FALSE);
     InvalidateRect(g.hwnd, &g.track_draw_rect, FALSE);
     InvalidateRect(g.hwnd, &g.flag_draw_rect, FALSE);
+    InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
 void load_last_state() {
@@ -995,10 +1330,6 @@ bool launch_showroom() {
     return false;
 }
 
-void refresh_results() {
-    update_results_list();
-}
-
 void apply_selection_to_ui() {
     auto select_in_list = [](HWND list, const std::vector<std::wstring>& items, const std::wstring& id) {
         for (int i = 0; i < static_cast<int>(items.size()); ++i) {
@@ -1016,6 +1347,9 @@ void apply_selection_to_ui() {
     select_in_list(g.track_list, g.filtered_tracks, g.selected_track);
     select_in_list(g.weather_list, g.filtered_weather, g.selected_weather);
     select_in_list(g.skin_list, g.filtered_skins, g.selected_skin);
+    load_car_curves();
+    populate_layouts();
+    refresh_track_preview();
 }
 
 void layout(HWND hwnd) {
@@ -1026,7 +1360,7 @@ void layout(HWND hwnd) {
     int usable = w - 2 * kMargin;
 
     // 4-column layout: 3 main list columns + 1 preview column
-    constexpr int kPreviewColW = 220;
+    constexpr int kPreviewColW = 280;
     int lists_w = usable - kPreviewColW - kColGap;
     int col     = (lists_w - 2 * kColGap) / 3;
     int col1    = left;
@@ -1042,7 +1376,7 @@ void layout(HWND hwnd) {
     constexpr int kBtnH     = 30;
     constexpr int kBtnGap   = 6;
     constexpr int kResultsH = 130;
-    constexpr int kStatusH  = 80;
+    constexpr int kStatusH  = 150;
     constexpr int kSaveBtnW = 130;
 
     int filter1_y = kHeaderH + kLGap;                 // ~54
@@ -1114,9 +1448,9 @@ void layout(HWND hwnd) {
     MoveWindow(g.launch_original, btns_x,            btns_start + kBtnH + kBtnGap,   btns_w,             kBtnH, TRUE);
     MoveWindow(g.refresh_results, btns_x,            btns_start + 2*(kBtnH+kBtnGap), btns_w,             kBtnH, TRUE);
 
-    // ---- Results and Status ---------------------------------------------
-    MoveWindow(g.results, left, results_y, usable, kResultsH, TRUE);
-    MoveWindow(g.status,  left, status_y,  usable, kStatusH,  TRUE);
+    // ---- Curve panel (replaces ListView) + Status ----------------------
+    g.curve_draw_rect = {left, results_y, left + usable, results_y + kResultsH};
+    MoveWindow(g.status, left, status_y, usable, kStatusH, TRUE);
 
     InvalidateRect(hwnd, nullptr, FALSE);
 }
@@ -1178,22 +1512,6 @@ void create_controls(HWND hwnd) {
     g.launch_original = mk(L"BUTTON", L"Launch Original", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 120, 30, IDC_LAUNCH_ORIGINAL);
     g.refresh_results = mk(L"BUTTON", L"Refresh Results", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 120, 30, IDC_REFRESH_RESULTS);
 
-    g.results = mk(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL, 0, 0, 100, 100, IDC_RESULTS);
-    ListView_SetExtendedListViewStyle(g.results, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-    ListView_SetBkColor(g.results,     kClrCtrlBg2);
-    ListView_SetTextBkColor(g.results, kClrCtrlBg2);
-    ListView_SetTextColor(g.results,   kClrCtrlText);
-    {
-        LVCOLUMNW col{};
-        col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-        col.pszText = const_cast<LPWSTR>(L"Field");
-        col.cx = 140;
-        ListView_InsertColumn(g.results, 0, &col);
-        col.pszText = const_cast<LPWSTR>(L"Value");
-        col.cx = 880;
-        ListView_InsertColumn(g.results, 1, &col);
-    }
-
     g.status = mk(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 0, 0, 100, 70, IDC_STATUS);
 }
 
@@ -1216,7 +1534,7 @@ void refresh_ui_from_state() {
     load_presets_into_combo();
     if (!g.preset_names.empty()) SendMessageW(g.preset_list, CB_SETCURSEL, 0, 0);
     update_status_panel();
-    update_results_list();
+    update_status_panel();
 }
 
 void open_original_and_exit() {
@@ -1267,32 +1585,29 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                     auto* car = find_car(g.selected_car);
                     if (car) g.selected_skin = car->skins.empty() ? L"default" : car->skins.front().id;
                     update_skins();
+                    load_car_curves();
                     update_status_panel();
-                    update_results_list();
                 }
             }
             if (id == IDC_SKIN_LIST && code == LBN_SELCHANGE) {
                 int idx = listbox_selected(g.skin_list);
                 if (idx >= 0 && idx < static_cast<int>(g.filtered_skins.size())) {
                     g.selected_skin = extract_id_from_row(g.filtered_skins[static_cast<size_t>(idx)]);
-                    // Atualiza preview sem reconstruir a lista (evita perda do highlight)
                     if (!g.selected_car.empty() && !g.selected_skin.empty()) {
                         fs::path p = fs::path(g.base_dir) / L"content" / L"cars" / g.selected_car / L"skins" / g.selected_skin / L"preview.jpg";
                         set_preview_bitmap(load_bitmap_from_file(p));
                     }
                     update_status_panel();
-                    update_results_list();
                 }
             }
             if (id == IDC_TRACK_LIST && code == LBN_SELCHANGE) {
                 int idx = listbox_selected(g.track_list);
                 if (idx >= 0 && idx < static_cast<int>(g.filtered_tracks.size())) {
                     g.selected_track = extract_id_from_row(g.filtered_tracks[static_cast<size_t>(idx)]);
-                    g.selected_layout.clear(); // reset layout ao mudar de pista
+                    g.selected_layout.clear();
                     populate_layouts();
                     refresh_track_preview();
                     update_status_panel();
-                    update_results_list();
                 }
             }
             if (id == IDC_LAYOUT_LIST && code == CBN_SELCHANGE) {
@@ -1301,7 +1616,6 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                     g.selected_layout = g.track_layouts[static_cast<size_t>(idx)];
                     refresh_track_preview();
                     update_status_panel();
-                    update_results_list();
                 }
             }
             if (id == IDC_WEATHER_LIST && code == LBN_SELCHANGE) {
@@ -1309,7 +1623,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 if (idx >= 0 && idx < static_cast<int>(g.filtered_weather.size())) {
                     g.selected_weather = extract_id_from_row(g.filtered_weather[static_cast<size_t>(idx)]);
                     update_status_panel();
-                    update_results_list();
+                    update_status_panel();
                 }
             }
             if (id == IDC_SAVE_PRESET && code == BN_CLICKED) {
@@ -1338,11 +1652,14 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
-            if (g.app_font)   DeleteObject(g.app_font);
-            if (g.title_font) DeleteObject(g.title_font);
-            if (g.br_bg)      DeleteObject(g.br_bg);
-            if (g.br_ctrl)    DeleteObject(g.br_ctrl);
-            if (g.br_ctrl2)   DeleteObject(g.br_ctrl2);
+            if (g.app_font)            DeleteObject(g.app_font);
+            if (g.title_font)          DeleteObject(g.title_font);
+            if (g.br_bg)               DeleteObject(g.br_bg);
+            if (g.br_ctrl)             DeleteObject(g.br_ctrl);
+            if (g.br_ctrl2)            DeleteObject(g.br_ctrl2);
+            if (g.track_outline_bitmap) DeleteObject(g.track_outline_bitmap);
+            if (g.car_curve_flag_bitmap) DeleteObject(g.car_curve_flag_bitmap);
+            if (g.car_badge_bitmap)      DeleteObject(g.car_badge_bitmap);
             PostQuitMessage(0);
             return 0;
         // ---- Dark theme for child controls --------------------------------
