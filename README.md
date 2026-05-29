@@ -2,6 +2,8 @@
 
 A tiny experimental launcher replacement for **Assetto Corsa**.
 
+![ACExorcist screenshot](images/before_race.png)
+
 I made this because I wanted to test a steering wheel on Linux/Proton, but the original Assetto Corsa launcher can fail before the actual simulator starts. The simulator itself can often run fine; the fragile part is the launcher stack around it.
 
 The original launcher is `AssettoCorsa.exe` — a .NET + CEF (Chromium Embedded Framework) application. That is a lot of infrastructure for something that ultimately writes a few INI files and calls `CreateProcess`. On Wine/Proton that stack has extra failure modes.
@@ -199,6 +201,4 @@ Review the code before running it.
 
 ## License
 
-No license has been chosen yet.
-
-Until a license is added, assume all rights are reserved by the author.
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.

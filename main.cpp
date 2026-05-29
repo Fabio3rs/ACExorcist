@@ -375,13 +375,15 @@ void set_car_badge_bitmap(HBITMAP bmp) {
 
 void draw_bitmap_scaled(HDC hdc, HBITMAP bmp, const RECT& rc) {
     if (!bmp) return;
-    HDC mem = CreateCompatibleDC(hdc);
-    HBITMAP old = static_cast<HBITMAP>(SelectObject(mem, bmp));
-    BITMAP bm{};
-    GetObject(bmp, sizeof(bm), &bm);
-    StretchBlt(hdc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, mem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
-    SelectObject(mem, old);
-    DeleteDC(mem);
+    // Usa GDI+ Bicubic em vez de StretchBlt para melhor qualidade de redimensionamento
+    Graphics gfx(hdc);
+    gfx.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    gfx.SetSmoothingMode(SmoothingModeHighQuality);
+    gfx.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+    Bitmap gdibmp(bmp, nullptr);
+    gfx.DrawImage(&gdibmp,
+        (INT)rc.left, (INT)rc.top,
+        (INT)(rc.right - rc.left), (INT)(rc.bottom - rc.top));
 }
 
 void paint_frame(HDC hdc, const RECT& client) {

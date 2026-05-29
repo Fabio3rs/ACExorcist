@@ -1,0 +1,40 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix
+
+      - name: Build ACExorcist.exe
+        run: |
+          x86_64-w64-mingw32-g++-posix main.cpp \
+            -O2 -std=c++20 -DUNICODE=1 -municode -mwindows \
+            -I. \
+            -o ACExorcist.exe \
+            -lgdi32 -lgdiplus -lcomctl32 \
+            -static
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACExorcist-${{ github.sha }}
+          path: ACExorcist.exe
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ACExorcist.exe
+          generate_release_notes: true
