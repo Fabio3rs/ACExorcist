@@ -123,8 +123,8 @@ struct AppState {
     RECT flag_draw_rect{};
     RECT curve_draw_rect{};   // torque/power curve panel (replaces ListView)
     // Bitmaps de background do painel de curva (bandeira do carro + badge)
-    HBITMAP car_curve_flag_bitmap{};  // bandeira do país do carro
-    HBITMAP car_badge_bitmap{};       // badge/logo do carro (ui/badge.png)
+    HBITMAP car_curve_flag_bitmap{};      // bandeira do país do carro
+    Gdiplus::Bitmap* car_badge_gdip{};   // badge/logo do carro (ui/badge.png) — mantém alpha nativo
     // Torque and power curves loaded from ui_car.json
     std::vector<std::pair<float,float>> curve_torque;
     std::vector<std::pair<float,float>> curve_power;
@@ -367,9 +367,9 @@ void set_car_curve_flag_bitmap(HBITMAP bmp) {
     if (g.hwnd) InvalidateRect(g.hwnd, &g.curve_draw_rect, FALSE);
 }
 
-void set_car_badge_bitmap(HBITMAP bmp) {
-    if (g.car_badge_bitmap) DeleteObject(g.car_badge_bitmap);
-    g.car_badge_bitmap = bmp;
+void set_car_badge_bitmap(Gdiplus::Bitmap* bmp) {
+    delete g.car_badge_gdip;
+    g.car_badge_gdip = bmp;
     if (g.hwnd) InvalidateRect(g.hwnd, &g.curve_draw_rect, FALSE);
 }
 
@@ -560,18 +560,33 @@ void paint_frame(HDC hdc, const RECT& client) {
             }
 
             // Badge: canto inferior direito, 60×60 no máximo, mantendo proporção
-            if (g.car_badge_bitmap) {
+            // Usa GDI+ Bitmap* diretamente para preservar alpha nativo do PNG
+            if (g.car_badge_gdip && g.car_badge_gdip->GetLastStatus() == Ok) {
                 constexpr int kBadgeMax = 60;
-                BITMAP bm{}; GetObject(g.car_badge_bitmap, sizeof(bm), &bm);
-                float aspect = (bm.bmHeight > 0) ? static_cast<float>(bm.bmWidth) / bm.bmHeight : 1.0f;
+                float aspect = (g.car_badge_gdip->GetHeight() > 0)
+                    ? static_cast<float>(g.car_badge_gdip->GetWidth()) / g.car_badge_gdip->GetHeight()
+                    : 1.0f;
                 int dw, dh;
                 if (aspect >= 1.0f) { dw = kBadgeMax; dh = static_cast<int>(kBadgeMax / aspect); }
                 else                { dh = kBadgeMax; dw = static_cast<int>(kBadgeMax * aspect); }
                 int dx = cr.right  - dw - 6;
                 int dy = cr.bottom - dh - 6;
-                // badge tem fundo branco geralmente — torna branco/quase-branco transparente
-                draw_bmp_alpha(g.car_badge_bitmap, Rect(dx, dy, dw, dh), 0.30f,
-                               true, Color(190, 190, 190), Color(255, 255, 255));
+                Graphics gfx(hdc);
+                gfx.SetInterpolationMode(InterpolationModeHighQualityBilinear);
+                // Apenas opacidade via ColorMatrix — o alpha nativo do PNG faz o resto
+                ImageAttributes ia;
+                ColorMatrix cm = {{
+                    {1, 0, 0, 0,     0},
+                    {0, 1, 0, 0,     0},
+                    {0, 0, 1, 0,     0},
+                    {0, 0, 0, 0.45f, 0},
+                    {0, 0, 0, 0,     1}
+                }};
+                ia.SetColorMatrix(&cm, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);
+                int sw = static_cast<int>(g.car_badge_gdip->GetWidth());
+                int sh = static_cast<int>(g.car_badge_gdip->GetHeight());
+                gfx.DrawImage(g.car_badge_gdip,
+                    Rect(dx, dy, dw, dh), 0, 0, sw, sh, UnitPixel, &ia);
             }
         }
 
@@ -1081,9 +1096,14 @@ void load_car_curves() {
                 }
             } catch (...) {}
         }
-        // Badge do carro (content/cars/{id}/ui/badge.png)
+        // Badge do carro (content/cars/{id}/ui/badge.png) — carrega Bitmap* direto para alpha nativo
         fs::path badge_path = car_ui / L"badge.png";
-        set_car_badge_bitmap(load_bitmap_from_file(badge_path));
+        if (fs::exists(badge_path)) {
+            auto* b = new Gdiplus::Bitmap(badge_path.c_str());
+            set_car_badge_bitmap((b && b->GetLastStatus() == Ok) ? b : (delete b, nullptr));
+        } else {
+            set_car_badge_bitmap(nullptr);
+        }
     }
     if (g.hwnd) InvalidateRect(g.hwnd, &g.curve_draw_rect, FALSE);
 }
@@ -1659,9 +1679,9 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             if (g.br_bg)               DeleteObject(g.br_bg);
             if (g.br_ctrl)             DeleteObject(g.br_ctrl);
             if (g.br_ctrl2)            DeleteObject(g.br_ctrl2);
-            if (g.track_outline_bitmap) DeleteObject(g.track_outline_bitmap);
+            if (g.track_outline_bitmap)  DeleteObject(g.track_outline_bitmap);
             if (g.car_curve_flag_bitmap) DeleteObject(g.car_curve_flag_bitmap);
-            if (g.car_badge_bitmap)      DeleteObject(g.car_badge_bitmap);
+            delete g.car_badge_gdip;  g.car_badge_gdip = nullptr;
             PostQuitMessage(0);
             return 0;
         // ---- Dark theme for child controls --------------------------------
